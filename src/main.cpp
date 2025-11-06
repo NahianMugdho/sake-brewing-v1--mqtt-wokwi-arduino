@@ -40,8 +40,9 @@ int stepSpeed = 30; // 0..100 (default 30)
 unsigned long lastReadTime = 0, lastStepTime = 0, lastServoTime = 0;
 float slope = 3.8333;  // calibration slope (m)
 float intercept = -9.5; // calibration intercept (c)
-
-
+String co2;
+String sug;
+String res;
 
 const float RL_VALUE = 5.0;    // load resistor value in kΩ
 const float RO = 10.0;         // fixed Ro in kΩ (simulation)
@@ -155,6 +156,12 @@ void readSensors() {
   // distance2 = (duration2 == 0) ? 999 : (duration2 / 58.2);
     float distance = getDistance();        // cm
      brix = distanceToBrix(distance); // °Brix
+     if(brix<10){
+      sug = "FEND";
+     }
+     else{
+      sug = "FON";
+     }
 
   gasValue = MQRead(GAS_PIN);
 
@@ -176,21 +183,31 @@ void readSensors() {
   // compute ppm for each gas (float)
    ppm = MQGetPercentageFloat(ratio, AlcoholCurve);
 
-  // auto printPPM = [](const char *name, float v) {
-  //   Serial.print(name);
-  //   Serial.print(F(": "));
-  //   if (!isFinitePositive(v) || v > 1e7) {
-  //     Serial.println(F("--")); // invalid or out-of-range
-  //   } else {
-  //     Serial.print(v, 2);
-  //     Serial.println(F(" ppm"));
-  //   }
-  // };
+  if(ppm<1000){
+      co2 = "COFF";
+  }
+  else{
+    co2 = "CON";
+  }
 
 
 
-
-
+  // if(co2 == "CON" && sug == "FEND")
+  // {
+  //   res = "Fermentation Complete";
+  // }
+  // else if(co2 == "COFF" && sug == "FEND")
+  // {
+  //   res = "Farmentation off, Check CO2, Sugar level ok";
+  // }
+  // else if(co2 == "CON" && sug == "FON")
+  // {
+  //     res = "Farmentation Ongoing, High Sugar";
+  // }
+  // else
+  // {
+  //   res = "Farmentation OFF";
+  // }
 
 
 
@@ -290,6 +307,8 @@ void handleRoot() {
       Sonar1: <span id='s1'>0</span> cm<br>
       Sonar2: <span id='s2'>0</span> °brix<br>
       MQ: <span id='mq'>0</span><br>
+      Fermentation: <span id='sug'> </span><br>
+      CO2: <span id='co2'> </span><br>
     </div>
 
     <div class='card'>
@@ -325,6 +344,8 @@ void handleRoot() {
           document.getElementById('mq').innerText = d.mq;
           document.getElementById('pump').innerText = d.pump ? "ON" : "OFF";
           document.getElementById('fan').innerText = d.fan ? "ON" : "OFF";
+          document.getElementById('sug').innerText = d.sug;
+          document.getElementById('co2').innerText = d.co2;
 
           // update slider with backend speed value (keeps UI in sync)
           document.getElementById("spdVal").innerText = d.speed;
@@ -355,6 +376,9 @@ void handleSensor() {
   json += "\"pump\":" + String(servoActive ? 1 : 0) + ",";
   json += "\"fan\":" + String(stepperActive ? 1 : 0) + ",";
   json += "\"speed\":" + String(stepSpeed);
+  json += ",\"sug\":\"" + sug + "\"";
+  json += ",\"co2\":\"" + co2 + "\"";
+
   json += "}";
   server.send(200, "application/json", json);
 }

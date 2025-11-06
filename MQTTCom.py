@@ -23,7 +23,9 @@ TOPICS = {
     "SONAR1": "ESP_S_4",         # Ultrasonic 1 (send)
     "SONAR2": "ESP_S_5",         # Ultrasonic 2 (send)
     "MQ": "ESP_S_6",             # Gas Sensor (send)
-    "FAN": "ESP_S_7"             # Fan speed control (receive)
+    "FAN": "ESP_S_7",
+    "DATA1": "ESP_S_8" ,
+    "DATA2": "ESP_S_9"    # Fan speed control (receive)
 }
 
 # ============================================================
