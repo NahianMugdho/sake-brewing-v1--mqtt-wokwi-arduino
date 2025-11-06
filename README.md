@@ -1,7 +1,7 @@
 # Fermentation Monitoring System
 
 This project is a **fermentation monitoring system** built using an **ESP32 DevKitC V4** in a **Wokwi simulation**. It integrates multiple sensors and actuators to monitor the fermentation environment and respond automatically to certain conditions.  
-
+WOKWI_HOST = "http://localhost:8180"  # ESP WebServer
 ---
 
 ## Features

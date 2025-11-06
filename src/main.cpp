@@ -38,14 +38,97 @@ WebServer server(80);
 
 int stepSpeed = 30; // 0..100 (default 30)
 unsigned long lastReadTime = 0, lastStepTime = 0, lastServoTime = 0;
+float slope = 3.8333;  // calibration slope (m)
+float intercept = -9.5; // calibration intercept (c)
+
+
+
+const float RL_VALUE = 5.0;    // load resistor value in kΩ
+const float RO = 10.0;         // fixed Ro in kΩ (simulation)
+const int ADC_MAX = 4095;      // ADC resolution max (ESP32 = 4095). Set to 1023 for Arduino UNO.
+// ---------------------------
+
+// curves: { log10(ppm_point), log10(Rs/Ro_at_point), slope }
+float LPGCurve[3]     = {2.3, 0.21, -0.47};
+float COCurve[3]      = {2.3, 0.72, -0.34};
+float SmokeCurve[3]   = {2.3, 0.53, -0.44};
+float AlcoholCurve[3] = {2.3, 0.28, -0.47};
+
+// ---------- helpers ----------
+float MQResistanceCalculation(int raw_adc) {
+  if (raw_adc <= 0) return -1.0; // invalid
+  if (raw_adc >= ADC_MAX) return 1e9; // extremely small sensor voltage -> huge resistance
+  // Rs = RL * (ADC_MAX - raw) / raw
+  return ( RL_VALUE * ( (float)(ADC_MAX - raw_adc) / (float)raw_adc ) );
+}
+
+float MQRead(int mq_pin) {
+  float rs = 0.0;
+  const int samples = 5;
+  for (int i = 0; i < samples; ++i) {
+    int raw = analogRead(mq_pin);
+    float r = MQResistanceCalculation(raw);
+    if (r < 0) return -1.0;
+    rs += r;
+    delay(50);
+  }
+  return rs / (float)samples;
+}
+
+bool isFinitePositive(float v) {
+  return isfinite(v) && (v > 0.0);
+}
+
+float MQGetPercentageFloat(float rs_ro_ratio, float *pcurve) {
+  // returns ppm as float. Uses log10 consistently with pcurve entries
+  if (!isFinitePositive(rs_ro_ratio)) return NAN;
+  float log_ratio = log10(rs_ro_ratio);
+  float x = ( (log_ratio - pcurve[1]) / pcurve[2] ) + pcurve[0];
+  // result = 10^x
+  return pow(10.0, x);
+}
+
+
+
+
+
+
+
+
+
+
+// Function to measure distance from sonar (in cm)
+float getDistance() {
+  digitalWrite(TRIG2, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG2, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG2, LOW);
+
+  long duration = pulseIn(ECHO2, HIGH);
+  // Convert time to distance (sound speed = 0.034 cm/μs)
+  float distance = duration * 0.034 / 2.0;
+  return distance;
+}
+
+// Convert distance (cm) to °Brix
+float distanceToBrix(float distance) {
+  float brix = slope * distance + intercept;
+  if (brix < 0) brix = 0;  // clamp for sanity
+  return brix;
+}
+
+
 #define READ_INTERVAL 1000
 #define SERVO_INTERVAL 15
 
-float dsTemp = 0.0, dhtTemp = 0.0, dhtHum = 0.0;
+float dsTemp = 0.0, dhtTemp = 0.0, dhtHum = 0.0,brix=0.0;
 int distance1 = 0, distance2 = 0, gasValue = 0;
+double ppm =0;
 bool servoActive = false;
 bool stepperActive = false;
-
+double a = 6.18898729177493e-16;
+double b = 4.856191982;
 // ------------------- Sensor Reading -------------------
 void readSensors() {
   ds.requestTemperatures();
@@ -65,13 +148,64 @@ void readSensors() {
   distance1 = (duration1 == 0) ? 999 : (duration1 / 58.2);
 
   // Sonar 2
-  digitalWrite(TRIG2, LOW); delayMicroseconds(2);
-  digitalWrite(TRIG2, HIGH); delayMicroseconds(10);
-  digitalWrite(TRIG2, LOW);
-  long duration2 = pulseIn(ECHO2, HIGH, 30000);
-  distance2 = (duration2 == 0) ? 999 : (duration2 / 58.2);
+  // digitalWrite(TRIG2, LOW); delayMicroseconds(2);
+  // digitalWrite(TRIG2, HIGH); delayMicroseconds(10);
+  // digitalWrite(TRIG2, LOW);
+  // long duration2 = pulseIn(ECHO2, HIGH, 30000);
+  // distance2 = (duration2 == 0) ? 999 : (duration2 / 58.2);
+    float distance = getDistance();        // cm
+     brix = distanceToBrix(distance); // °Brix
 
-  gasValue = analogRead(GAS_PIN);
+  gasValue = MQRead(GAS_PIN);
+
+
+ float rs = gasValue;
+  float ratio = NAN;
+  if (isFinitePositive(rs) && RO > 0.0) 
+      ratio = rs / RO;
+  if (!isFinitePositive(rs)) {
+    Serial.println(F("Rs: invalid"));
+    Serial.println(F("Rs/Ro: --"));
+  } else {
+    Serial.print(F("Rs (kΩ): "));
+    Serial.println(rs, 3);
+    Serial.print(F("Rs/Ro Ratio: "));
+    Serial.println(ratio, 4);
+  }
+
+  // compute ppm for each gas (float)
+   ppm = MQGetPercentageFloat(ratio, AlcoholCurve);
+
+  // auto printPPM = [](const char *name, float v) {
+  //   Serial.print(name);
+  //   Serial.print(F(": "));
+  //   if (!isFinitePositive(v) || v > 1e7) {
+  //     Serial.println(F("--")); // invalid or out-of-range
+  //   } else {
+  //     Serial.print(v, 2);
+  //     Serial.println(F(" ppm"));
+  //   }
+  // };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
 }
 
 // ------------------- Actuator Logic -------------------
@@ -154,7 +288,7 @@ void handleRoot() {
       DHT22 Temp: <span id='dt'>0</span>°C<br>
       Humidity: <span id='dh'>0</span>%<br>
       Sonar1: <span id='s1'>0</span> cm<br>
-      Sonar2: <span id='s2'>0</span> cm<br>
+      Sonar2: <span id='s2'>0</span> °brix<br>
       MQ: <span id='mq'>0</span><br>
     </div>
 
@@ -216,8 +350,8 @@ void handleSensor() {
   json += "\"dht_temp\":" + String(dhtTemp, 2) + ",";
   json += "\"dht_hum\":" + String(dhtHum, 2) + ",";
   json += "\"sonar1\":" + String(distance1) + ",";
-  json += "\"sonar2\":" + String(distance2) + ",";
-  json += "\"mq\":" + String(gasValue) + ",";
+  json += "\"sonar2\":" + String(brix) + ",";
+  json += "\"mq\":" + String(ppm) + ",";
   json += "\"pump\":" + String(servoActive ? 1 : 0) + ",";
   json += "\"fan\":" + String(stepperActive ? 1 : 0) + ",";
   json += "\"speed\":" + String(stepSpeed);
