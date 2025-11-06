@@ -25,7 +25,8 @@ TOPICS = {
     "MQ": "ESP_S_6",             # Gas Sensor (send)
     "FAN": "ESP_S_7",
     "DATA1": "ESP_S_8" ,
-    "DATA2": "ESP_S_9"    # Fan speed control (receive)
+    "DATA2": "ESP_S_9",
+    "Result":"ESP_S_10",    # Fan speed control (receive)
 }
 
 # ============================================================

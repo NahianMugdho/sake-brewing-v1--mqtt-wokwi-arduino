@@ -192,22 +192,22 @@ void readSensors() {
 
 
 
-  // if(co2 == "CON" && sug == "FEND")
-  // {
-  //   res = "Fermentation Complete";
-  // }
-  // else if(co2 == "COFF" && sug == "FEND")
-  // {
-  //   res = "Farmentation off, Check CO2, Sugar level ok";
-  // }
-  // else if(co2 == "CON" && sug == "FON")
-  // {
-  //     res = "Farmentation Ongoing, High Sugar";
-  // }
-  // else
-  // {
-  //   res = "Farmentation OFF";
-  // }
+  if(co2 == "CON" && sug == "FEND")
+  {
+    res = "Fermentation Complete";
+  }
+  else if(co2 == "COFF" && sug == "FEND")
+  {
+    res = "Farmentation off, Check CO2, Sugar level ok";
+  }
+  else if(co2 == "CON" && sug == "FON")
+  {
+      res = "Farmentation Ongoing, High Sugar";
+  }
+  else
+  {
+    res = "Farmentation OFF";
+  }
 
 
 
@@ -309,6 +309,7 @@ void handleRoot() {
       MQ: <span id='mq'>0</span><br>
       Fermentation: <span id='sug'> </span><br>
       CO2: <span id='co2'> </span><br>
+      Result: <span id='res'> </span><br>
     </div>
 
     <div class='card'>
@@ -346,7 +347,7 @@ void handleRoot() {
           document.getElementById('fan').innerText = d.fan ? "ON" : "OFF";
           document.getElementById('sug').innerText = d.sug;
           document.getElementById('co2').innerText = d.co2;
-
+          document.getElementById('res').innerText = d.res;
           // update slider with backend speed value (keeps UI in sync)
           document.getElementById("spdVal").innerText = d.speed;
           document.getElementById("spd").value = d.speed;
@@ -378,7 +379,7 @@ void handleSensor() {
   json += "\"speed\":" + String(stepSpeed);
   json += ",\"sug\":\"" + sug + "\"";
   json += ",\"co2\":\"" + co2 + "\"";
-
+   json += ",\"res\":\"" + res + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }

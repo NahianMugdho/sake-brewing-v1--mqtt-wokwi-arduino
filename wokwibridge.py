@@ -110,9 +110,9 @@ TOPICS_SEND = {
     "ESP_S_4": "sonar1",
     "ESP_S_5": "sonar2",
     "ESP_S_6": "mq",
-    "ESP_S_7":"sug",
     "ESP_S_8":"co2",
      "ESP_S_9":"sug",
+     "ESP_S_10":"res",
 }
 
 TOPIC_RECEIVE = "ESP_S_7"  # fan speed control
