@@ -128,8 +128,8 @@ int distance1 = 0, distance2 = 0, gasValue = 0;
 double ppm =0;
 bool servoActive = false;
 bool stepperActive = false;
-double a = 6.18898729177493e-16;
-double b = 4.856191982;
+// double a = 6.18898729177493e-16;
+// double b = 4.856191982;
 // ------------------- Sensor Reading -------------------
 void readSensors() {
   ds.requestTemperatures();
@@ -231,7 +231,7 @@ void controlActuators() {
   unsigned long now_ms = millis();
 
   // Example condition to run stepper: dsTemp > 100 (keeps original logic)
-  stepperActive = dsTemp > 100;
+  stepperActive = dsTemp > 19;
 
   // map stepSpeed 0..100 to pulse interval in microseconds
   // Higher stepSpeed -> smaller interval -> faster pulses
