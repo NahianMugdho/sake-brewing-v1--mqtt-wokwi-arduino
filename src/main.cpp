@@ -6,6 +6,9 @@
 #include <DallasTemperature.h>
 #include "DHT.h"
 #include <ESP32Servo.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 // ------------------- WiFi -------------------
 #define WIFI_SSID "Wokwi-GUEST"
@@ -36,42 +39,58 @@ DHT dht(DHT_PIN, DHT_TYPE);
 Servo servo;
 WebServer server(80);
 
-int stepSpeed = 30; // 0..100 (default 30)
-unsigned long lastReadTime = 0, lastStepTime = 0, lastServoTime = 0;
-float slope = 3.8333;  // calibration slope (m)
-float intercept = -9.5; // calibration intercept (c)
-String co2;
-String sug;
-String res;
+// FreeRTOS mutex for protecting shared state
+SemaphoreHandle_t stateMutex;
+
+// Shared sensor / state variables (use volatile where appropriate)
+volatile float dsTemp = 0.0;
+volatile float dhtTemp = 0.0;
+volatile float dhtHum = 0.0;
+volatile float brix = 0.0;
+volatile int distance1 = 0;
+volatile int distance2 = 0;
+volatile int gasValue = 0;
+volatile double ppm = 0;
+volatile bool servoActive = false;
+volatile bool stepperActive = false;
+volatile int stepSpeed = 30; // 0..100
+
+String co2 = "COFF";
+String sug = "FON";
+String res = "Farmentation OFF";
 
 const float RL_VALUE = 5.0;    // load resistor value in kΩ
 const float RO = 10.0;         // fixed Ro in kΩ (simulation)
-const int ADC_MAX = 4095;      // ADC resolution max (ESP32 = 4095). Set to 1023 for Arduino UNO.
-// ---------------------------
+const int ADC_MAX = 4095;      // ADC resolution max (ESP32 = 4095).
+
+// calibration
+float slope = 3.8333;  // old slope (you can re-calibrate)
+float intercept = -9.5; // old intercept
+
+// sensor timing
+#define READ_INTERVAL 1000  // ms
+#define CONTROL_INTERVAL 20 // ms
 
 // curves: { log10(ppm_point), log10(Rs/Ro_at_point), slope }
-float LPGCurve[3]     = {2.3, 0.21, -0.47};
-float COCurve[3]      = {2.3, 0.72, -0.34};
-float SmokeCurve[3]   = {2.3, 0.53, -0.44};
 float AlcoholCurve[3] = {2.3, 0.28, -0.47};
 
 // ---------- helpers ----------
 float MQResistanceCalculation(int raw_adc) {
   if (raw_adc <= 0) return -1.0; // invalid
-  if (raw_adc >= ADC_MAX) return 1e9; // extremely small sensor voltage -> huge resistance
-  // Rs = RL * (ADC_MAX - raw) / raw
+  if (raw_adc >= ADC_MAX) return 1e9;
   return ( RL_VALUE * ( (float)(ADC_MAX - raw_adc) / (float)raw_adc ) );
 }
 
 float MQRead(int mq_pin) {
   float rs = 0.0;
-  const int samples = 5;
+  const int samples = 3;        // fewer samples to reduce blocking
   for (int i = 0; i < samples; ++i) {
     int raw = analogRead(mq_pin);
     float r = MQResistanceCalculation(raw);
     if (r < 0) return -1.0;
     rs += r;
-    delay(50);
+    // short yield so other tasks remain responsive
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
   return rs / (float)samples;
 }
@@ -81,22 +100,11 @@ bool isFinitePositive(float v) {
 }
 
 float MQGetPercentageFloat(float rs_ro_ratio, float *pcurve) {
-  // returns ppm as float. Uses log10 consistently with pcurve entries
   if (!isFinitePositive(rs_ro_ratio)) return NAN;
   float log_ratio = log10(rs_ro_ratio);
   float x = ( (log_ratio - pcurve[1]) / pcurve[2] ) + pcurve[0];
-  // result = 10^x
   return pow(10.0, x);
 }
-
-
-
-
-
-
-
-
-
 
 // Function to measure distance from sonar (in cm)
 float getDistance() {
@@ -106,182 +114,20 @@ float getDistance() {
   delayMicroseconds(10);
   digitalWrite(TRIG2, LOW);
 
-  long duration = pulseIn(ECHO2, HIGH);
-  // Convert time to distance (sound speed = 0.034 cm/μs)
+  long duration = pulseIn(ECHO2, HIGH, 30000); // 30ms timeout
+  if (duration == 0) return 999.0; // no echo
   float distance = duration * 0.034 / 2.0;
   return distance;
 }
 
 // Convert distance (cm) to °Brix
 float distanceToBrix(float distance) {
-  float brix = slope * distance + intercept;
-  if (brix < 0) brix = 0;  // clamp for sanity
-  return brix;
+  float b = slope * distance + intercept;
+  if (b < 0) b = 0;
+  return b;
 }
 
-
-#define READ_INTERVAL 1000
-#define SERVO_INTERVAL 15
-
-float dsTemp = 0.0, dhtTemp = 0.0, dhtHum = 0.0,brix=0.0;
-int distance1 = 0, distance2 = 0, gasValue = 0;
-double ppm =0;
-bool servoActive = false;
-bool stepperActive = false;
-// double a = 6.18898729177493e-16;
-// double b = 4.856191982;
-// ------------------- Sensor Reading -------------------
-void readSensors() {
-  ds.requestTemperatures();
-  dsTemp = ds.getTempCByIndex(0);
-  if (dsTemp == -127.0) dsTemp = 0;
-
-  dhtTemp = dht.readTemperature();
-  dhtHum = dht.readHumidity();
-  if (isnan(dhtTemp)) dhtTemp = 0;
-  if (isnan(dhtHum)) dhtHum = 0;
-
-  // Sonar 1
-  digitalWrite(TRIG1, LOW); delayMicroseconds(2);
-  digitalWrite(TRIG1, HIGH); delayMicroseconds(10);
-  digitalWrite(TRIG1, LOW);
-  long duration1 = pulseIn(ECHO1, HIGH, 30000);
-  distance1 = (duration1 == 0) ? 999 : (duration1 / 58.2);
-
-  // Sonar 2
-  // digitalWrite(TRIG2, LOW); delayMicroseconds(2);
-  // digitalWrite(TRIG2, HIGH); delayMicroseconds(10);
-  // digitalWrite(TRIG2, LOW);
-  // long duration2 = pulseIn(ECHO2, HIGH, 30000);
-  // distance2 = (duration2 == 0) ? 999 : (duration2 / 58.2);
-    float distance = getDistance();        // cm
-     brix = distanceToBrix(distance); // °Brix
-     if(brix<10){
-      sug = "FEND";
-     }
-     else{
-      sug = "FON";
-     }
-
-  gasValue = MQRead(GAS_PIN);
-
-
- float rs = gasValue;
-  float ratio = NAN;
-  if (isFinitePositive(rs) && RO > 0.0) 
-      ratio = rs / RO;
-  if (!isFinitePositive(rs)) {
-    Serial.println(F("Rs: invalid"));
-    Serial.println(F("Rs/Ro: --"));
-  } else {
-    Serial.print(F("Rs (kΩ): "));
-    Serial.println(rs, 3);
-    Serial.print(F("Rs/Ro Ratio: "));
-    Serial.println(ratio, 4);
-  }
-
-  // compute ppm for each gas (float)
-   ppm = MQGetPercentageFloat(ratio, AlcoholCurve);
-
-  if(ppm<1000){
-      co2 = "COFF";
-  }
-  else{
-    co2 = "CON";
-  }
-
-
-
-  if(co2 == "CON" && sug == "FEND")
-  {
-    res = "Fermentation Complete";
-  }
-  else if(co2 == "COFF" && sug == "FEND")
-  {
-    res = "Farmentation off, Check CO2, Sugar level ok";
-  }
-  else if(co2 == "CON" && sug == "FON")
-  {
-      res = "Farmentation Ongoing, High Sugar";
-  }
-  else
-  {
-    res = "Farmentation OFF";
-  }
-
-
-
-
-
-
-
-
-
-
-
-
- 
- 
-
-}
-
-// ------------------- Actuator Logic -------------------
-void controlActuators() {
-  unsigned long now_us = micros();
-  unsigned long now_ms = millis();
-
-  // Example condition to run stepper: dsTemp > 100 (keeps original logic)
-  stepperActive = dsTemp > 19;
-
-  // map stepSpeed 0..100 to pulse interval in microseconds
-  // Higher stepSpeed -> smaller interval -> faster pulses
-  unsigned long interval = map(stepSpeed, 0, 100, 2000, 200);  // microseconds
-
-  if (stepperActive && (now_us - lastStepTime >= interval)) {
-    lastStepTime = now_us;
-
-    // STEP pulse for A4988
-    digitalWrite(STEP_PIN, HIGH);
-    delayMicroseconds(2); // minimum HIGH pulse
-    digitalWrite(STEP_PIN, LOW);
-
-    // Toggle debug LED to visualize pulses
-    digitalWrite(DEBUG_LED, !digitalRead(DEBUG_LED));
-  }
-
-  // Debug Serial: print stepper state and interval every 500ms
-  static unsigned long lastDebug = 0;
-  if (now_ms - lastDebug > 500) {
-    lastDebug = now_ms;
-    if (stepperActive) {
-      Serial.print("[Stepper] Speed=");
-      Serial.print(stepSpeed);
-      Serial.print(" | Interval=");
-      Serial.print(interval);
-      Serial.println(" us");
-    } else {
-      Serial.println("[Stepper] OFF");
-    }
-  }
-
-  // Servo control based on sonar distance1 (existing logic)
-  if (distance1 < 20) {
-    servoActive = true;
-    static int pos = 0, dir = 1;
-    if (now_ms - lastServoTime >= SERVO_INTERVAL) {
-      lastServoTime = now_ms;
-      pos += dir;
-      if (pos >= 180) dir = -1;
-      else if (pos <= 0) dir = 1;
-      servo.write(pos);
-    }
-  } else {
-    servoActive = false;
-    servo.write(90);
-  }
-}
-
-// ------------------- Web Dashboard -------------------
+// ------------------- Web Dashboard (same HTML but with full absolute fetch you had) -------------------
 void handleRoot() {
   String html = R"rawliteral(
   <!DOCTYPE html><html>
@@ -325,9 +171,8 @@ void handleRoot() {
     <script>
       async function setSpeed(v){
         document.getElementById("spdVal").innerText = v;
-        // call control endpoint to set speed and also ensure fan ON
         try {
-          await fetch(`/control?target=fan&state=on&speed=${v}`);
+          await fetch(`http://localhost:8180/control?target=fan&state=on&speed=${v}`);
         } catch(e) {
           console.log("Error setting speed", e);
         }
@@ -335,7 +180,10 @@ void handleRoot() {
 
       async function updateData(){
         try {
-          let res = await fetch('/sensor');
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 900);
+          let res = await fetch('http://localhost:8180/sensor', { signal: controller.signal });
+          clearTimeout(timeoutId);
           let d = await res.json();
           document.getElementById('ds').innerText = d.ds18b20;
           document.getElementById('dt').innerText = d.dht_temp;
@@ -348,7 +196,6 @@ void handleRoot() {
           document.getElementById('sug').innerText = d.sug;
           document.getElementById('co2').innerText = d.co2;
           document.getElementById('res').innerText = d.res;
-          // update slider with backend speed value (keeps UI in sync)
           document.getElementById("spdVal").innerText = d.speed;
           document.getElementById("spd").value = d.speed;
         } catch(e) {
@@ -356,7 +203,7 @@ void handleRoot() {
         }
       }
 
-      setInterval(updateData, 1000);
+      setInterval(updateData, 2000);
       window.onload = updateData;
     </script>
   </body>
@@ -367,21 +214,27 @@ void handleRoot() {
 
 // ------------------- JSON API -------------------
 void handleSensor() {
-  String json = "{";
-  json += "\"ds18b20\":" + String(dsTemp, 2) + ",";
-  json += "\"dht_temp\":" + String(dhtTemp, 2) + ",";
-  json += "\"dht_hum\":" + String(dhtHum, 2) + ",";
-  json += "\"sonar1\":" + String(distance1) + ",";
-  json += "\"sonar2\":" + String(brix) + ",";
-  json += "\"mq\":" + String(ppm) + ",";
-  json += "\"pump\":" + String(servoActive ? 1 : 0) + ",";
-  json += "\"fan\":" + String(stepperActive ? 1 : 0) + ",";
-  json += "\"speed\":" + String(stepSpeed);
-  json += ",\"sug\":\"" + sug + "\"";
-  json += ",\"co2\":\"" + co2 + "\"";
-   json += ",\"res\":\"" + res + "\"";
-  json += "}";
-  server.send(200, "application/json", json);
+  // gather snapshot under mutex
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    String json = "{";
+    json += "\"ds18b20\":" + String((double)dsTemp, 2) + ",";
+    json += "\"dht_temp\":" + String((double)dhtTemp, 2) + ",";
+    json += "\"dht_hum\":" + String((double)dhtHum, 2) + ",";
+    json += "\"sonar1\":" + String((int)distance1) + ",";
+    json += "\"sonar2\":" + String((double)brix) + ",";
+    json += "\"mq\":" + String((double)ppm) + ",";
+    json += "\"pump\":" + String(servoActive ? 1 : 0) + ",";
+    json += "\"fan\":" + String(stepperActive ? 1 : 0) + ",";
+    json += "\"speed\":" + String(stepSpeed);
+    json += ",\"sug\":\"" + sug + "\"";
+    json += ",\"co2\":\"" + co2 + "\"";
+    json += ",\"res\":\"" + res + "\"";
+    json += "}";
+    xSemaphoreGive(stateMutex);
+    server.send(200, "application/json", json);
+  } else {
+    server.send(503, "text/plain", "busy");
+  }
 }
 
 // ------------------- Control API -------------------
@@ -394,28 +247,175 @@ void handleControl() {
   String target = server.arg("target");
   String state = server.arg("state");
 
-  if (target == "fan") {
-    // Optional speed parameter
-    if (server.hasArg("speed")) {
-      int sp = server.arg("speed").toInt();
-      if (sp < 0) sp = 0;
-      if (sp > 100) sp = 100;
-      stepSpeed = sp;
-      Serial.print("[HTTP] Speed set to: ");
-      Serial.println(stepSpeed);
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (target == "fan") {
+      if (server.hasArg("speed")) {
+        int sp = server.arg("speed").toInt();
+        if (sp < 0) sp = 0;
+        if (sp > 100) sp = 100;
+        stepSpeed = sp;
+        Serial.print("[HTTP] Speed set to: ");
+        Serial.println(stepSpeed);
+      }
+      stepperActive = (state == "on");
+      server.send(200, "text/plain", "OK");
+      xSemaphoreGive(stateMutex);
+      return;
+    } else if (target == "pump") {
+      servoActive = (state == "on");
+      servo.write(servoActive ? 180 : 90);
+      server.send(200, "text/plain", "OK");
+      xSemaphoreGive(stateMutex);
+      return;
+    } else {
+      xSemaphoreGive(stateMutex);
+      server.send(404, "text/plain", "Unknown target");
+      return;
     }
-    // state on/off controls stepperActive flag (but actuator logic also checks dsTemp)
-    stepperActive = (state == "on");
-    server.send(200, "text/plain", "OK");
-    return;
-  } else if (target == "pump") {
-    servoActive = (state == "on");
-    servo.write(servoActive ? 180 : 90);
-    server.send(200, "text/plain", "OK");
-    return;
   } else {
-    server.send(404, "text/plain", "Unknown target");
-    return;
+    server.send(503, "text/plain", "busy");
+  }
+}
+
+// ------------------- Tasks -------------------
+
+// sensorTask: reads sensors every READ_INTERVAL ms
+void sensorTask(void *pvParameters) {
+  (void) pvParameters;
+  for (;;) {
+    // read DS18B20
+    ds.requestTemperatures();
+    float ds_t = ds.getTempCByIndex(0);
+    if (ds_t == -127.0) ds_t = 0;
+
+    // DHT
+    float dht_t = dht.readTemperature();
+    float dht_h = dht.readHumidity();
+    if (isnan(dht_t)) dht_t = 0;
+    if (isnan(dht_h)) dht_h = 0;
+
+    // Sonar1
+    digitalWrite(TRIG1, LOW); delayMicroseconds(2);
+    digitalWrite(TRIG1, HIGH); delayMicroseconds(10);
+    digitalWrite(TRIG1, LOW);
+    long duration1 = pulseIn(ECHO1, HIGH, 30000);
+    int dist1 = (duration1 == 0) ? 999 : (int)(duration1 / 58.2);
+
+    // Sonar2 -> distanceToBrix
+    float distance = getDistance();
+    float b = distanceToBrix(distance);
+
+    // MQ sensor
+    float rs = MQRead(GAS_PIN);
+    double p = NAN;
+    if (isFinitePositive(rs) && RO > 0.0) {
+      float ratio = rs / RO;
+      p = MQGetPercentageFloat(ratio, AlcoholCurve);
+    }
+
+    // compute flags & result string
+    String local_co2 = (isnan(p) ? "COFF" : (p < 1000 ? "COFF" : "CON"));
+    String local_sug = (b < 10 ? "FEND" : "FON");
+    String local_res;
+    if (local_co2 == "CON" && local_sug == "FEND") local_res = "Fermentation Complete";
+    else if (local_co2 == "COFF" && local_sug == "FEND") local_res = "Farmentation off, Check CO2, Sugar level ok";
+    else if (local_co2 == "CON" && local_sug == "FON") local_res = "Farmentation Ongoing, High Sugar";
+    else local_res = "Farmentation OFF";
+
+    // store snapshot under mutex
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      dsTemp = ds_t;
+      dhtTemp = dht_t;
+      dhtHum = dht_h;
+      distance1 = dist1;
+      brix = b;
+      gasValue = (int)rs;
+      ppm = isnan(p) ? NAN : p;
+      co2 = local_co2;
+      sug = local_sug;
+      res = local_res;
+      xSemaphoreGive(stateMutex);
+    }
+
+    // breathing time between reads
+    vTaskDelay(pdMS_TO_TICKS(READ_INTERVAL));
+  }
+}
+
+// controlTask: runs actuator logic (non-blocking)
+void controlTask(void *pvParameters) {
+  (void) pvParameters;
+  unsigned long lastStepTimeUs = micros();
+  for (;;) {
+    // sample snapshot quick
+    float local_dsTemp;
+    int local_distance1;
+    int local_stepSpeed;
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      local_dsTemp = dsTemp;
+      local_distance1 = distance1;
+      local_stepSpeed = stepSpeed;
+      xSemaphoreGive(stateMutex);
+    } else {
+      local_dsTemp = 0;
+      local_distance1 = 999;
+      local_stepSpeed = 30;
+    }
+
+    // stepperActive logic
+    bool local_stepperActive = local_dsTemp > 19;
+
+    // compute pulse interval from stepSpeed
+    unsigned long intervalUs = map(local_stepSpeed, 0, 100, 2000, 200);
+
+    unsigned long nowUs = micros();
+    if (local_stepperActive && (nowUs - lastStepTimeUs >= intervalUs)) {
+      lastStepTimeUs = nowUs;
+      digitalWrite(STEP_PIN, HIGH);
+      delayMicroseconds(2);
+      digitalWrite(STEP_PIN, LOW);
+      // toggle LED for visible heartbeat
+      
+    }
+    // LED heartbeat independent of step pulse
+static unsigned long lastLedToggle = 0;
+unsigned long ledIntervalMs = map(local_stepSpeed, 0, 100, 1000, 100);
+if (millis() - lastLedToggle >= ledIntervalMs) {
+    lastLedToggle = millis();
+    digitalWrite(DEBUG_LED, !digitalRead(DEBUG_LED));
+}
+
+    // servo control based on distance1
+    static int pos = 90;
+    static int dir = 1;
+    if (local_distance1 < 20) {
+      servoActive = true;
+      pos += dir;
+      if (pos >= 180) dir = -1;
+      if (pos <= 0) dir = 1;
+      servo.write(pos);
+    } else {
+      servoActive = false;
+      servo.write(90);
+    }
+
+    // commit stepperActive & servoActive under mutex
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      stepperActive = local_stepperActive;
+      xSemaphoreGive(stateMutex);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(CONTROL_INTERVAL));
+  }
+}
+
+// webTask: keep server responsive (call handleClient frequently)
+void webTask(void *pvParameters) {
+  (void) pvParameters;
+  for (;;) {
+    server.handleClient();
+    // tiny delay to yield CPU to other tasks
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
@@ -431,7 +431,6 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) {
     delay(200);
     Serial.print(".");
-    // optional timeout to avoid infinite block (10s)
     if (millis() - startAttempt > 10000) break;
   }
 
@@ -454,8 +453,14 @@ void setup() {
   pinMode(TRIG2, OUTPUT); pinMode(ECHO2, INPUT);
   pinMode(GAS_PIN, INPUT);
 
-  // set default direction for A4988
   digitalWrite(DIR_PIN, HIGH);
+
+  // create mutex
+  stateMutex = xSemaphoreCreateMutex();
+  if (stateMutex == NULL) {
+    Serial.println("Failed to create mutex!");
+    while (1) { delay(1000); }
+  }
 
   server.on("/", handleRoot);
   server.on("/sensor", handleSensor);
@@ -463,15 +468,14 @@ void setup() {
   server.begin();
 
   Serial.println("HTTP server started");
+
+  // create tasks
+  xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 2, NULL, 1); // core 1
+  xTaskCreatePinnedToCore(controlTask, "ControlTask", 3072, NULL, 2, NULL, 1); // core 1
+  xTaskCreatePinnedToCore(webTask, "WebTask", 4096, NULL, 3, NULL, 0); // core 0
 }
 
 void loop() {
-  unsigned long now_ms = millis();
-  if (now_ms - lastReadTime >= READ_INTERVAL) {
-    lastReadTime = now_ms;
-    readSensors();
-  }
-
-  controlActuators();
-  server.handleClient();
+  // empty — work is handled in tasks
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
